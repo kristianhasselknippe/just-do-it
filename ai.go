@@ -12,23 +12,38 @@ import (
 
 // GenerateCommand uses an LLM to convert a natural language prompt into a bash command.
 func GenerateCommand(prompt string) (string, error) {
+	cfg, _ := LoadConfig() // Ignore error, treat as empty config
+
 	ctx := context.Background()
 	var llm llms.Model
 	var err error
 
+	// Priority: Env Vars > Config File
+
+	googleKey := os.Getenv("GOOGLE_API_KEY")
+	if googleKey == "" && cfg != nil {
+		googleKey = cfg.GoogleAPIKey
+	}
+
+	openaiKey := os.Getenv("OPENAI_API_KEY")
+	if openaiKey == "" && cfg != nil {
+		openaiKey = cfg.OpenAIAPIKey
+	}
+
 	// Check for Google API Key first
-	if apiKey := os.Getenv("GOOGLE_API_KEY"); apiKey != "" {
-		llm, err = googleai.New(ctx, googleai.WithAPIKey(apiKey), googleai.WithDefaultModel("gemini-pro"))
+	if googleKey != "" {
+		llm, err = googleai.New(ctx, googleai.WithAPIKey(googleKey), googleai.WithDefaultModel("gemini-pro"))
 		if err != nil {
 			return "", fmt.Errorf("failed to create GoogleAI client: %w", err)
 		}
-	} else if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
-		llm, err = openai.New(openai.WithToken(apiKey))
+	} else if openaiKey != "" {
+		llm, err = openai.New(openai.WithToken(openaiKey))
 		if err != nil {
 			return "", fmt.Errorf("failed to create OpenAI client: %w", err)
 		}
 	} else {
-		return "", fmt.Errorf("neither GOOGLE_API_KEY nor OPENAI_API_KEY is set. Please set one to use AI features.")
+		// Return specific error type/string to trigger UI flow
+		return "", fmt.Errorf("MISSING_API_KEY")
 	}
 
 	content := []llms.MessageContent{

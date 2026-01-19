@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -41,6 +40,8 @@ const (
 	viewList state = iota
 	viewInput
 	viewGenerating
+	viewApiKeyInput
+	viewProviderSelect
 )
 
 // Data structures for parsing 'just --dump --dump-format json'
@@ -94,6 +95,7 @@ type model struct {
 	inputs         []textinput.Model
 	spinner        spinner.Model
 	focusIndex     int
+	providerIndex  int // Track selected provider
 	state          state
 	recipes        map[string]Recipe
 	selectedRecipe *Recipe
@@ -273,7 +275,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						func() tea.Msg {
 							cmdStr, err := GenerateCommand(prompt)
 							if err != nil {
-								return err
+								if err.Error() == "MISSING_API_KEY" {
+									return err
+								}
+								return fmt.Errorf("AI Error: %v", err)
 							}
 							return aiCompletionMsg(cmdStr)
 						},
@@ -328,225 +333,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.list, cmd = m.list.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 				cmds = append(cmds, cmd)
 			}
-		} else if m.state == viewInput {
-			// Input view specific keys
-			switch msg.String() {
-			case "esc":
-				m.state = viewList
-				m.inputs = nil
-				return m, nil
-			case "tab", "shift+tab", "up", "down":
-				s := msg.String()
-
-				if s == "up" || s == "shift+tab" {
-					m.focusIndex--
-				} else {
-					m.focusIndex++
-				}
-
-				if m.focusIndex > len(m.inputs)-1 {
-					m.focusIndex = 0
-				} else if m.focusIndex < 0 {
-					m.focusIndex = len(m.inputs) - 1
-				}
-
-				cmds := make([]tea.Cmd, len(m.inputs))
-				for i := 0; i <= len(m.inputs)-1; i++ {
-					if i == m.focusIndex {
-						// Set focused state
-						cmds[i] = m.inputs[i].Focus()
-						continue
-					}
-					// Remove focused state
-					m.inputs[i].Blur()
-				}
-				return m, tea.Batch(cmds...)
-
-			case "enter":
-				// If not on last input, move next
-				if m.focusIndex < len(m.inputs)-1 {
-					m.inputs[m.focusIndex].Blur()
-					m.focusIndex++
-					m.inputs[m.focusIndex].Focus()
-					return m, textinput.Blink
-				}
-
-				// Execute with args
-				args := []string{}
-				for i, input := range m.inputs {
-					val := input.Value()
-					if val == "" && m.selectedRecipe.Parameters[i].Default != nil {
-						val = *m.selectedRecipe.Parameters[i].Default
-					}
-
-					if m.selectedRecipe.Parameters[i].Kind == "plus" || m.selectedRecipe.Parameters[i].Kind == "star" {
-						// Split variadic
-						args = append(args, strings.Fields(val)...)
-					} else {
-						args = append(args, val)
-					}
-				}
-
-				// Handle AI command special case (name is "AI Command")
-				// If it's an AI command, we just want to run the input string directly as a shell command?
-				// User wants "convert prompt to bash command" and then "Run".
-				// So if name is "AI Command", we should run `bash -c <cmd>` or just `<cmd>`?
-				// The previous code appends "just <task> <args>".
-				// Here we want to execute the raw command.
-
-				if m.selectedRecipe.Name == "AI Command" {
-					// We assume the first input is the full command
-					// We split it to handle arguments roughly, or use sh -c
-					// Using sh -c is safer for complex commands
-					m.finalCmd = []string{"sh", "-c", args[0]}
-				} else {
-					cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
-					m.finalCmd = cmdSlice
-				}
-				return m, tea.Quit
-			case "ctrl+f":
-				// Trigger fzf
-				c := exec.Command("fzf")
-				var out bytes.Buffer
-				c.Stdout = &out
-				c.Stdin = os.Stdin
-				c.Stderr = os.Stderr
-
-				return m, tea.ExecProcess(c, func(err error) tea.Msg {
-					if err != nil {
-						return nil
-					}
-					return pasteMsg(strings.TrimSpace(out.String()))
-				})
+			// Update all inputs
+			for i := range m.inputs {
+				m.inputs[i], cmd = m.inputs[i].Update(msg)
+				cmds = append(cmds, cmd)
 			}
-		}
-
-	case pasteMsg:
-		if m.state == viewInput && len(msg) > 0 {
-			// Insert into currently focused input
-			input := m.inputs[m.focusIndex]
-
-			// Insert the text at the cursor
-			val := input.Value()
-			cursor := input.Position()
-
-			// Simple insertion
-			newVal := ""
-			if cursor >= len(val) {
-				newVal = val + string(msg)
-			} else {
-				newVal = val[:cursor] + string(msg) + val[cursor:]
-			}
-			input.SetValue(newVal)
-			input.SetCursor(cursor + len(msg))
-
-			// Update the model slice
-			m.inputs[m.focusIndex] = input
-		}
-
-	case aiCompletionMsg:
-		m.state = viewInput
-		// Create a dummy recipe for the AI command
-		m.selectedRecipe = &Recipe{
-			Name:       "AI Command",
-			Parameters: []Parameter{{Name: "command", Default: nil}},
-		}
-		// Setup input
-		t := textinput.New()
-		t.Prompt = "Run: "
-		t.Width = m.terminalWidth - 10
-		t.SetValue(string(msg))
-		t.Focus()
-		m.inputs = []textinput.Model{t}
-		m.focusIndex = 0
-		return m, textinput.Blink
-
-	case spinner.TickMsg:
-		if m.state == viewGenerating {
-			var cmd tea.Cmd
-			m.spinner, cmd = m.spinner.Update(msg)
-			return m, cmd
-		}
-
-	case tea.WindowSizeMsg:
-		m.terminalWidth = msg.Width
-		m.terminalHeight = msg.Height
-
-		// Layout logic
-		listWidth := int(float64(msg.Width) * 0.35)
-
-		// Calculation of available width for viewport:
-		viewportWidth := msg.Width - listWidth - 8
-
-		headerHeight := lipgloss.Height(m.list.Title)
-		listFooterHeight := 2 // Pagination
-		globalFooterHeight := 1
-
-		// Adjust list height to fit global footer
-		m.list.SetSize(listWidth, msg.Height-headerHeight-listFooterHeight-globalFooterHeight)
-
-		if !m.ready {
-			m.viewport = viewport.New(viewportWidth, msg.Height-2-globalFooterHeight)
-			m.viewport.HighPerformanceRendering = false
-			m.ready = true
-		} else {
-			m.viewport.Width = viewportWidth
-			m.viewport.Height = msg.Height - 2 - globalFooterHeight
-		}
-
-		if m.list.SelectedItem() != nil {
-			if i, ok := m.list.SelectedItem().(recipeItem); ok {
-				cmds = append(cmds, m.updateViewportContent(i.name))
-			}
-		}
-
-	case recipeContentMsg:
-		content := string(msg)
-		// Wrap content to fit viewport width to prevent UI breakage
-		if m.viewport.Width > 0 {
-			content = lipgloss.NewStyle().Width(m.viewport.Width).Render(content)
-		}
-		m.viewport.SetContent(content)
-
-	case error:
-		m.err = msg
-		return m, nil
-	}
-
-	// Only update active component
-	if m.state == viewList {
-		prevItem := m.list.SelectedItem()
-		m.list, cmd = m.list.Update(msg)
-		cmds = append(cmds, cmd)
-
-		// Sync AI prompt
-		*m.aiPrompt = m.list.FilterValue()
-
-		currItem := m.list.SelectedItem()
-		// Only update viewport if it's a recipeItem
-		if currItem != nil {
-			if i, ok := currItem.(recipeItem); ok {
-				if prevItem == nil || prevItem.FilterValue() != i.name {
-					cmds = append(cmds, m.updateViewportContent(i.name))
-				}
-				if _, ok := msg.(tea.WindowSizeMsg); ok {
-					cmds = append(cmds, m.updateViewportContent(i.name))
-				}
-			} else if _, ok := currItem.(aiItem); ok {
-				// Clear viewport or show help for AI?
-				m.viewport.SetContent(lipgloss.NewStyle().Width(m.viewport.Width).Render("Select to generate a command using AI based on your search text."))
-			}
-		}
-
-		m.viewport, cmd = m.viewport.Update(msg)
-		cmds = append(cmds, cmd)
-	} else if m.state == viewGenerating {
-		// Just wait for spinner/AI
-	} else {
-		// Update all inputs
-		for i := range m.inputs {
-			m.inputs[i], cmd = m.inputs[i].Update(msg)
-			cmds = append(cmds, cmd)
 		}
 	}
 
@@ -573,7 +364,7 @@ func (m model) View() string {
 	}
 
 	var content string
-	if m.state == viewInput {
+	if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect {
 		content = m.inputView()
 	} else if m.state == viewGenerating {
 		content = fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
@@ -601,6 +392,10 @@ func (m model) footerView() string {
 		keys = []string{"↑/↓/j/k: navigate", "enter: select", "type: search", "q: quit"}
 	} else if m.state == viewInput {
 		keys = []string{"tab/shift+tab: nav fields", "ctrl+f: find file", "enter: run", "esc: cancel"}
+	} else if m.state == viewApiKeyInput {
+		keys = []string{"enter: save key", "esc: cancel"}
+	} else if m.state == viewProviderSelect {
+		keys = []string{"↑/↓: select provider", "enter: next", "esc: cancel"}
 	}
 	// Join with some spacing and styling. Ensure it spans full width or looks good.
 	return helpStyle.Render(strings.Join(keys, " • "))
@@ -608,6 +403,48 @@ func (m model) footerView() string {
 
 func (m model) inputView() string {
 	var b strings.Builder
+
+	if m.state == viewProviderSelect {
+		b.WriteString(titleStyle.Render("Select AI Provider"))
+		b.WriteString("\n\n")
+
+		providers := []string{"Google Gemini", "OpenAI"}
+		for i, p := range providers {
+			cursor := " "
+			if m.providerIndex == i {
+				cursor = ">"
+			}
+			// Simple highlighting
+			if m.providerIndex == i {
+				b.WriteString(fmt.Sprintf("%s %s\n", cursor, lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(p)))
+			} else {
+				b.WriteString(fmt.Sprintf("%s %s\n", cursor, p))
+			}
+		}
+
+		return lipgloss.Place(
+			m.terminalWidth,
+			m.terminalHeight-1,
+			lipgloss.Center,
+			lipgloss.Center,
+			b.String(),
+		)
+	}
+
+	if m.state == viewApiKeyInput {
+		b.WriteString(titleStyle.Render("Enter API Key"))
+		b.WriteString("\n\n")
+		b.WriteString("Please enter your Google (Gemini) or OpenAI API Key.\nIt will be saved to your config file.\n\n")
+		b.WriteString(m.inputs[0].View())
+
+		return lipgloss.Place(
+			m.terminalWidth,
+			m.terminalHeight-1,
+			lipgloss.Center,
+			lipgloss.Center,
+			b.String(),
+		)
+	}
 
 	// Title
 	b.WriteString(titleStyle.Render("Run Task: " + m.selectedRecipe.Name))
