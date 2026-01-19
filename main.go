@@ -625,7 +625,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelList.Title = "Select Model"
 		m.modelList.SetShowHelp(false)
 
+		// Use fuzzy filter
+		m.modelList.Filter = func(term string, targets []string) []list.Rank {
+			if len(targets) == 0 {
+				return nil
+			}
+			matches := fuzzy.Find(term, targets)
+			ranks := make([]list.Rank, len(matches))
+			for i, match := range matches {
+				ranks[i] = list.Rank{
+					Index:          match.Index,
+					MatchedIndexes: match.MatchedIndexes,
+				}
+			}
+			return ranks
+		}
+
 		// Set size
+
 		headerHeight := lipgloss.Height(m.modelList.Title)
 		m.modelList.SetSize(m.terminalWidth, m.terminalHeight-headerHeight-2)
 		return m, nil
@@ -682,14 +699,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// wait
 	} else if m.state == viewModelSelect {
 		var cmd tea.Cmd
-		prevItem := m.modelList.SelectedItem()
+
+		// Handle typing to filter instantly
+		if !m.modelList.SettingFilter() {
+			if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.Type == tea.KeyRunes {
+				m.modelList, cmd = m.modelList.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+				cmds = append(cmds, cmd)
+			}
+		}
+
 		m.modelList, cmd = m.modelList.Update(msg)
 		cmds = append(cmds, cmd)
-
-		// Handle selection
-		if m.modelList.SelectedItem() != nil && m.modelList.SelectedItem() != prevItem {
-			// just nav
-		}
 
 		// Check for enter key specifically since list consumes it
 		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "enter" {
