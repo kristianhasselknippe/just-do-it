@@ -193,23 +193,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
-		case "q":
-			if m.state == viewList && !m.list.SettingFilter() {
-				return m, tea.Quit
-			}
-		case "esc":
-			if m.state == viewInput {
-				m.state = viewList
-				m.input.Reset()
-				return m, nil
-			}
-			if m.state == viewList && !m.list.SettingFilter() {
-				return m, tea.Quit
-			}
+		}
 
-		case "enter":
-			if m.state == viewList {
-				// Select task
+		if m.state == viewList {
+			// Handle special keys for the list view
+			switch msg.String() {
+			case "enter":
+				// Select task (works for both browsing and filtering)
 				if i, ok := m.list.SelectedItem().(recipeItem); ok {
 					recipe := m.recipes[i.name]
 					m.selectedRecipe = &recipe
@@ -225,7 +215,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tea.Quit
 					}
 				}
-			} else if m.state == viewInput {
+			case "esc":
+				if m.list.SettingFilter() {
+					m.list.ResetFilter()
+					return m, nil
+				}
+				return m, tea.Quit
+			}
+
+			// Auto-activate filter on typing
+			if !m.list.SettingFilter() && msg.Type == tea.KeyRunes {
+				// We want to support navigation keys (j/k) if not typing?
+				// User said: "Writing anything should just start filtering".
+				// This implies fzf-style behavior where typing (even j/k) filters.
+				// Navigation must be done via arrows.
+
+				// Send a synthetic '/' key to start filtering
+				var cmd tea.Cmd
+				m.list, cmd = m.list.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+				cmds = append(cmds, cmd)
+				// The original key will be processed by the list update below
+			}
+		} else if m.state == viewInput {
+			// Input view specific keys
+			switch msg.String() {
+			case "esc":
+				m.state = viewList
+				m.input.Reset()
+				return m, nil
+			case "enter":
 				// Execute with args
 				args := strings.Fields(m.input.Value())
 				cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
