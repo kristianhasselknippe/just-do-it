@@ -32,7 +32,8 @@ func GenerateCommand(prompt string) (string, error) {
 
 	// Check for Google API Key first
 	if googleKey != "" {
-		llm, err = googleai.New(ctx, googleai.WithAPIKey(googleKey), googleai.WithDefaultModel("gemini-pro"))
+		// Use a model confirmed to be available via API listing
+		llm, err = googleai.New(ctx, googleai.WithAPIKey(googleKey), googleai.WithDefaultModel("gemini-2.0-flash"))
 		if err != nil {
 			return "", fmt.Errorf("failed to create GoogleAI client: %w", err)
 		}
@@ -47,9 +48,11 @@ func GenerateCommand(prompt string) (string, error) {
 	}
 
 	content := []llms.MessageContent{
-		llms.TextParts(llms.ChatMessageTypeSystem, `You are a helpful assistant that converts natural language requests into a single bash command. 
-Output ONLY the command. Do not include markdown code blocks, explanations, or quotes.`),
-		llms.TextParts(llms.ChatMessageTypeHuman, "Request: "+prompt+"\nCommand:"),
+		llms.TextParts(llms.ChatMessageTypeHuman,
+			`You are a helpful assistant that converts natural language requests into a single bash command. 
+Output ONLY the command. Do not include markdown code blocks, explanations, or quotes.
+Request: `+prompt+`
+Command:`),
 	}
 
 	completion, err := llm.GenerateContent(ctx, content,
