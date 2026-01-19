@@ -22,3 +22,7 @@ deploy: build
 shell:
     @echo "Entering shell... (type exit to return)"
     bash
+
+# Diffs two files (good for testing multiple args + file picker)
+diff file1 file2:
+    diff {{file1}} {{file2}}

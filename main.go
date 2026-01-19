@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -56,6 +57,7 @@ type Dependency struct {
 type Parameter struct {
 	Name    string  `json:"name"`
 	Default *string `json:"default"`
+	Kind    string  `json:"kind"`
 }
 
 // recipeItem implements list.Item
@@ -70,7 +72,8 @@ func (i recipeItem) FilterValue() string { return i.name }
 type model struct {
 	list           list.Model
 	viewport       viewport.Model
-	input          textinput.Model
+	inputs         []textinput.Model // Changed from single input to slice
+	focusIndex     int               // Track focused input
 	state          state
 	recipes        map[string]Recipe
 	selectedRecipe *Recipe
@@ -85,12 +88,7 @@ func main() {
 	m := model{
 		recipes: make(map[string]Recipe),
 		state:   viewList,
-		input:   textinput.New(),
 	}
-
-	m.input.Placeholder = "Enter arguments..."
-	m.input.CharLimit = 100
-	m.input.Width = 50
 
 	// Fetch recipes
 	dump, err := getJustDump()
@@ -177,6 +175,9 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
+// Msg to paste text into input
+type pasteMsg string
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		cmd  tea.Cmd
@@ -207,7 +208,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Check params
 					if len(recipe.Parameters) > 0 {
 						m.state = viewInput
-						m.input.Focus()
+						m.inputs = make([]textinput.Model, len(recipe.Parameters))
+						for i, p := range recipe.Parameters {
+							t := textinput.New()
+							t.Prompt = fmt.Sprintf("%s: ", p.Name)
+							t.Width = 50
+							if p.Default != nil {
+								t.Placeholder = fmt.Sprintf("%s (default)", *p.Default)
+							}
+							if i == 0 {
+								t.Focus()
+							}
+							m.inputs[i] = t
+						}
+						m.focusIndex = 0
 						return m, textinput.Blink
 					} else {
 						// Execute immediately
@@ -241,18 +255,113 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc":
 				m.state = viewList
-				m.input.Reset()
+				m.inputs = nil
 				return m, nil
+			case "tab", "shift+tab", "up", "down":
+				s := msg.String()
+
+				if s == "up" || s == "shift+tab" {
+					m.focusIndex--
+				} else {
+					m.focusIndex++
+				}
+
+				if m.focusIndex > len(m.inputs)-1 {
+					m.focusIndex = 0
+				} else if m.focusIndex < 0 {
+					m.focusIndex = len(m.inputs) - 1
+				}
+
+				cmds := make([]tea.Cmd, len(m.inputs))
+				for i := 0; i <= len(m.inputs)-1; i++ {
+					if i == m.focusIndex {
+						// Set focused state
+						cmds[i] = m.inputs[i].Focus()
+						continue
+					}
+					// Remove focused state
+					m.inputs[i].Blur()
+				}
+				return m, tea.Batch(cmds...)
+
 			case "enter":
+				// If not on last input, move next
+				if m.focusIndex < len(m.inputs)-1 {
+					m.inputs[m.focusIndex].Blur()
+					m.focusIndex++
+					m.inputs[m.focusIndex].Focus()
+					return m, textinput.Blink
+				}
+
 				// Execute with args
-				args := strings.Fields(m.input.Value())
+				args := []string{}
+				for i, input := range m.inputs {
+					val := input.Value()
+					if val == "" && m.selectedRecipe.Parameters[i].Default != nil {
+						val = *m.selectedRecipe.Parameters[i].Default
+					}
+
+					// Handle variadic args if necessary.
+					// For now, if user typed spaces in a singular arg, we preserve it as one arg?
+					// Just usually takes shell-split args.
+					// But usually TUI inputs map 1-to-1 with params.
+					// If the param kind is 'plus' or 'star' (variadic), we might want to Split it.
+					// 'diff file1 file2' are singular, so we append as is.
+
+					if m.selectedRecipe.Parameters[i].Kind == "plus" || m.selectedRecipe.Parameters[i].Kind == "star" {
+						// Split variadic
+						args = append(args, strings.Fields(val)...)
+					} else {
+						args = append(args, val)
+					}
+				}
+
 				cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
 				m.finalCmd = cmdSlice
 				return m, tea.Quit
+			case "ctrl+f":
+				// Trigger fzf
+				c := exec.Command("fzf")
+				var out bytes.Buffer
+				c.Stdout = &out
+				c.Stdin = os.Stdin
+				c.Stderr = os.Stderr
+
+				return m, tea.ExecProcess(c, func(err error) tea.Msg {
+					if err != nil {
+						// fzf cancelled or error
+						return nil
+					}
+					return pasteMsg(strings.TrimSpace(out.String()))
+				})
 			}
 		}
 
+	case pasteMsg:
+		if m.state == viewInput && len(msg) > 0 {
+			// Insert into currently focused input
+			input := m.inputs[m.focusIndex]
+
+			// Insert the text at the cursor
+			val := input.Value()
+			cursor := input.Position()
+
+			// Simple insertion
+			newVal := ""
+			if cursor >= len(val) {
+				newVal = val + string(msg)
+			} else {
+				newVal = val[:cursor] + string(msg) + val[cursor:]
+			}
+			input.SetValue(newVal)
+			input.SetCursor(cursor + len(msg))
+
+			// Update the model slice
+			m.inputs[m.focusIndex] = input
+		}
+
 	case tea.WindowSizeMsg:
+
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
@@ -304,8 +413,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
 	} else {
-		m.input, cmd = m.input.Update(msg)
-		cmds = append(cmds, cmd)
+		// Update all inputs
+		for i := range m.inputs {
+			m.inputs[i], cmd = m.inputs[i].Update(msg)
+			cmds = append(cmds, cmd)
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -354,21 +466,19 @@ func (m model) inputView() string {
 	b.WriteString(titleStyle.Render("Run Task: " + m.selectedRecipe.Name))
 	b.WriteString("\n\n")
 
-	// Parameters help
-	if len(m.selectedRecipe.Parameters) > 0 {
-		b.WriteString("Parameters:\n")
-		for _, p := range m.selectedRecipe.Parameters {
-			line := fmt.Sprintf("  %s", p.Name)
-			if p.Default != nil {
-				line += fmt.Sprintf(" (default: %s)", *p.Default)
-			}
-			b.WriteString(line + "\n")
-		}
+	// Render each input
+	for i, input := range m.inputs {
+		// Highlight the focused input prompt maybe?
+		// textinput handles its own focus styling if Focus() is called.
+		b.WriteString(input.View())
 		b.WriteString("\n")
+		// Add some spacing between inputs if needed
+		if i < len(m.inputs)-1 {
+			b.WriteString("\n")
+		}
 	}
 
-	b.WriteString(m.input.View())
-	b.WriteString("\n\n(Enter to run, Esc to cancel)")
+	b.WriteString("\n\n(Enter to next/run, Ctrl+f to find file, Esc to cancel)")
 
 	// Center logic could be here, but simple render is fine
 	return lipgloss.Place(
