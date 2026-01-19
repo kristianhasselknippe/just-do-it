@@ -6,8 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
+	"syscall"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -24,6 +27,13 @@ var (
 	statusMessageStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.AdaptiveColor{Light: "#04B575", Dark: "#04B575"}).
 				Render
+)
+
+type state int
+
+const (
+	viewList state = iota
+	viewInput
 )
 
 // Data structures for parsing 'just --dump --dump-format json'
@@ -60,17 +70,27 @@ func (i recipeItem) FilterValue() string { return i.name }
 type model struct {
 	list           list.Model
 	viewport       viewport.Model
+	input          textinput.Model
+	state          state
 	recipes        map[string]Recipe
+	selectedRecipe *Recipe
 	ready          bool
 	err            error
 	terminalWidth  int
 	terminalHeight int
+	finalCmd       []string // Command to exec on exit
 }
 
 func main() {
 	m := model{
 		recipes: make(map[string]Recipe),
+		state:   viewList,
+		input:   textinput.New(),
 	}
+
+	m.input.Placeholder = "Enter arguments..."
+	m.input.CharLimit = 100
+	m.input.Width = 50
 
 	// Fetch recipes
 	dump, err := getJustDump()
@@ -99,12 +119,32 @@ func main() {
 	delegate := list.NewDefaultDelegate()
 	m.list = list.New(items, delegate, 0, 0)
 	m.list.Title = "Just Tasks"
-	m.list.SetShowHelp(false) // We'll show our own help or minimal help
+	m.list.SetShowHelp(false)
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := p.Run(); err != nil {
+	finalModel, err := p.Run()
+	if err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)
 		os.Exit(1)
+	}
+
+	// Handle execution after TUI exit
+	if m, ok := finalModel.(model); ok && len(m.finalCmd) > 0 {
+		// Use syscall.Exec to replace the process
+		binary, lookErr := exec.LookPath(m.finalCmd[0])
+		if lookErr != nil {
+			fmt.Fprintf(os.Stderr, "Error finding command %s: %v\n", m.finalCmd[0], lookErr)
+			os.Exit(1)
+		}
+
+		// syscall.Exec requires the full path as the first argument,
+		// and the slice of arguments (including the command name) as the second.
+		// Environment variables are passed as the third argument.
+		execErr := syscall.Exec(binary, m.finalCmd, os.Environ())
+		if execErr != nil {
+			fmt.Fprintf(os.Stderr, "Error executing command: %v\n", execErr)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -128,16 +168,6 @@ type recipeContentMsg string
 func (m model) Init() tea.Cmd {
 	// Load the first item if it exists
 	if len(m.recipes) > 0 {
-		// We need the sorted name, similar to main.
-		// Since we don't store sorted items in model explicitly (only in list),
-		// and we can't easily access list items by index in Init without logic duplication,
-		// we'll rely on the WindowSizeMsg or the first Update to trigger it?
-		// Better: just trigger a generic "refresh" or wait for first key/resize.
-		// Actually, returning nil is fine, WindowSizeMsg usually comes first.
-		// But to be safe, let's try to update the first one if possible.
-		// Ideally we'd store the items in the model properly.
-		// For now, let's just let the loop handle it or the user press down/up.
-		// But let's try to grab the first item from the list model.
 		if len(m.list.Items()) > 0 {
 			if i, ok := m.list.Items()[0].(recipeItem); ok {
 				return m.updateViewportContent(i.name)
@@ -161,21 +191,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
-			// Only quit if not filtering
-			if !m.list.SettingFilter() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "q":
+			if m.state == viewList && !m.list.SettingFilter() {
+				return m, tea.Quit
+			}
+		case "esc":
+			if m.state == viewInput {
+				m.state = viewList
+				m.input.Reset()
+				return m, nil
+			}
+			if m.state == viewList && !m.list.SettingFilter() {
 				return m, tea.Quit
 			}
 
 		case "enter":
-			// Exec the selected task
-			if i, ok := m.list.SelectedItem().(recipeItem); ok {
-				return m, tea.ExecProcess(exec.Command("just", i.name), func(err error) tea.Msg {
-					if err != nil {
-						return fmt.Errorf("task failed: %v", err) // Simple error handling
+			if m.state == viewList {
+				// Select task
+				if i, ok := m.list.SelectedItem().(recipeItem); ok {
+					recipe := m.recipes[i.name]
+					m.selectedRecipe = &recipe
+
+					// Check params
+					if len(recipe.Parameters) > 0 {
+						m.state = viewInput
+						m.input.Focus()
+						return m, textinput.Blink
+					} else {
+						// Execute immediately
+						m.finalCmd = []string{"just", i.name}
+						return m, tea.Quit
 					}
-					return nil // Success
-				})
+				}
+			} else if m.state == viewInput {
+				// Execute with args
+				args := strings.Fields(m.input.Value())
+				cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
+				m.finalCmd = cmdSlice
+				return m, tea.Quit
 			}
 		}
 
@@ -183,19 +238,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
-		// Layout logic: Split 50/50? Or List 1/3, Viewport 2/3?
-		// Let's do List on left (35%), Viewport on right (65%)
+		// Layout logic
 		listWidth := int(float64(msg.Width) * 0.35)
 		viewportWidth := msg.Width - listWidth - 4 // minus padding/borders
 
 		headerHeight := lipgloss.Height(m.list.Title)
-		// Footer is generally 2 lines (pagination + help)
 		footerHeight := 2
 
 		m.list.SetSize(listWidth, msg.Height-headerHeight-footerHeight)
 
 		if !m.ready {
-			m.viewport = viewport.New(viewportWidth, msg.Height-2) // slightly smaller for borders
+			m.viewport = viewport.New(viewportWidth, msg.Height-2)
 			m.viewport.HighPerformanceRendering = false
 			m.ready = true
 		} else {
@@ -203,7 +256,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Height = msg.Height - 2
 		}
 
-		// Trigger a content update for the current selection
 		if m.list.SelectedItem() != nil {
 			cmds = append(cmds, m.updateViewportContent(m.list.SelectedItem().(recipeItem).name))
 		}
@@ -216,33 +268,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Capture previous selection to detect change
-	prevItem := m.list.SelectedItem()
+	// Only update active component
+	if m.state == viewList {
+		prevItem := m.list.SelectedItem()
+		m.list, cmd = m.list.Update(msg)
+		cmds = append(cmds, cmd)
 
-	m.list, cmd = m.list.Update(msg)
-	cmds = append(cmds, cmd)
+		currItem := m.list.SelectedItem()
+		if currItem != nil && (prevItem == nil || prevItem.(recipeItem).name != currItem.(recipeItem).name) {
+			cmds = append(cmds, m.updateViewportContent(currItem.(recipeItem).name))
+		}
 
-	// Check if selection changed
-	currItem := m.list.SelectedItem()
-	if currItem != nil && (prevItem == nil || prevItem.(recipeItem).name != currItem.(recipeItem).name) {
-		cmds = append(cmds, m.updateViewportContent(currItem.(recipeItem).name))
+		if _, ok := msg.(tea.WindowSizeMsg); ok && currItem != nil {
+			cmds = append(cmds, m.updateViewportContent(currItem.(recipeItem).name))
+		}
+
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	} else {
+		m.input, cmd = m.input.Update(msg)
+		cmds = append(cmds, cmd)
 	}
-
-	// If the window was resized, we need to make sure we update content too
-	if _, ok := msg.(tea.WindowSizeMsg); ok && currItem != nil {
-		cmds = append(cmds, m.updateViewportContent(currItem.(recipeItem).name))
-	}
-
-	m.viewport, cmd = m.viewport.Update(msg)
-	cmds = append(cmds, cmd)
 
 	return m, tea.Batch(cmds...)
 }
 
 func (m model) updateViewportContent(recipeName string) tea.Cmd {
 	return func() tea.Msg {
-		// Get detailed info
-		// We force color to make it look nice in the viewport
 		cmd := exec.Command("just", "--color", "always", "--show", recipeName)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -257,11 +309,13 @@ func (m model) View() string {
 		return fmt.Sprintf("\nError: %v\nPress any key to dismiss.", m.err)
 	}
 	if !m.ready {
-
 		return "\n  Initializing..."
 	}
 
-	// Layout
+	if m.state == viewInput {
+		return m.inputView()
+	}
+
 	listStyle := lipgloss.NewStyle().MarginRight(2)
 	viewportStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -272,5 +326,38 @@ func (m model) View() string {
 		lipgloss.Top,
 		listStyle.Render(m.list.View()),
 		viewportStyle.Width(m.viewport.Width).Height(m.viewport.Height).Render(m.viewport.View()),
+	)
+}
+
+func (m model) inputView() string {
+	var b strings.Builder
+
+	// Title
+	b.WriteString(titleStyle.Render("Run Task: " + m.selectedRecipe.Name))
+	b.WriteString("\n\n")
+
+	// Parameters help
+	if len(m.selectedRecipe.Parameters) > 0 {
+		b.WriteString("Parameters:\n")
+		for _, p := range m.selectedRecipe.Parameters {
+			line := fmt.Sprintf("  %s", p.Name)
+			if p.Default != nil {
+				line += fmt.Sprintf(" (default: %s)", *p.Default)
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(m.input.View())
+	b.WriteString("\n\n(Enter to run, Esc to cancel)")
+
+	// Center logic could be here, but simple render is fine
+	return lipgloss.Place(
+		m.terminalWidth,
+		m.terminalHeight,
+		lipgloss.Center,
+		lipgloss.Center,
+		b.String(),
 	)
 }
