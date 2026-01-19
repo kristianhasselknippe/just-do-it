@@ -11,10 +11,12 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sahilm/fuzzy"
 )
 
 var (
@@ -38,6 +40,7 @@ type state int
 const (
 	viewList state = iota
 	viewInput
+	viewGenerating
 )
 
 // Data structures for parsing 'just --dump --dump-format json'
@@ -72,11 +75,25 @@ func (i recipeItem) Title() string       { return i.name }
 func (i recipeItem) Description() string { return i.desc }
 func (i recipeItem) FilterValue() string { return i.name }
 
+type aiItem struct {
+	prompt *string
+}
+
+func (a aiItem) Title() string {
+	if a.prompt == nil || *a.prompt == "" {
+		return "✨ Generate command with AI"
+	}
+	return fmt.Sprintf("✨ Generate command for: %s", *a.prompt)
+}
+func (a aiItem) Description() string { return "Use AI to generate a bash command" }
+func (a aiItem) FilterValue() string { return "" }
+
 type model struct {
 	list           list.Model
 	viewport       viewport.Model
-	inputs         []textinput.Model // Changed from single input to slice
-	focusIndex     int               // Track focused input
+	inputs         []textinput.Model
+	spinner        spinner.Model
+	focusIndex     int
 	state          state
 	recipes        map[string]Recipe
 	selectedRecipe *Recipe
@@ -84,13 +101,20 @@ type model struct {
 	err            error
 	terminalWidth  int
 	terminalHeight int
-	finalCmd       []string // Command to exec on exit
+	finalCmd       []string
+	aiPrompt       *string // Shared pointer for AI item title
 }
 
 func main() {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
 	m := model{
-		recipes: make(map[string]Recipe),
-		state:   viewList,
+		recipes:  make(map[string]Recipe),
+		state:    viewList,
+		spinner:  s,
+		aiPrompt: new(string),
 	}
 
 	// Fetch recipes
@@ -116,11 +140,45 @@ func main() {
 		return items[i].(recipeItem).name < items[j].(recipeItem).name
 	})
 
+	// Append AI item
+	items = append(items, aiItem{prompt: m.aiPrompt})
+
 	// Setup list
 	delegate := list.NewDefaultDelegate()
 	m.list = list.New(items, delegate, 0, 0)
 	m.list.Title = "Just Tasks"
 	m.list.SetShowHelp(false)
+
+	// Custom filter to always include AI item
+	m.list.Filter = func(term string, targets []string) []list.Rank {
+		// If term is empty, bubbles/list handles it (usually)
+		// But if called, return nil to match standard behavior?
+		// Actually standard Filter returns matches.
+
+		// If targets is empty, return nil
+		if len(targets) == 0 {
+			return nil
+		}
+
+		// Real targets are all except the last one (AI item)
+		realTargets := targets[:len(targets)-1]
+		matches := fuzzy.Find(term, realTargets)
+
+		ranks := make([]list.Rank, len(matches))
+		for i, match := range matches {
+			ranks[i] = list.Rank{
+				Index:          match.Index,
+				MatchedIndexes: match.MatchedIndexes,
+			}
+		}
+
+		// Always append AI item (last item)
+		ranks = append(ranks, list.Rank{
+			Index: len(targets) - 1,
+		})
+
+		return ranks
+	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := p.Run()
@@ -181,6 +239,9 @@ func (m model) Init() tea.Cmd {
 // Msg to paste text into input
 type pasteMsg string
 
+// Msg for AI completion
+type aiCompletionMsg string
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		cmd  tea.Cmd
@@ -202,11 +263,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == viewList {
 			// Handle special keys for the list view
 			switch msg.String() {
-			case "q":
-				if !m.list.SettingFilter() {
-					return m, tea.Quit
-				}
 			case "enter":
+				// Check if AI item selected
+				if item, ok := m.list.SelectedItem().(aiItem); ok {
+					m.state = viewGenerating
+					prompt := *item.prompt
+					return m, tea.Batch(
+						m.spinner.Tick,
+						func() tea.Msg {
+							cmdStr, err := GenerateCommand(prompt)
+							if err != nil {
+								return err
+							}
+							return aiCompletionMsg(cmdStr)
+						},
+					)
+				}
+
 				// Select task (works for both browsing and filtering)
 				if i, ok := m.list.SelectedItem().(recipeItem); ok {
 					recipe := m.recipes[i.name]
@@ -236,6 +309,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tea.Quit
 					}
 				}
+			case "q":
+				if !m.list.SettingFilter() {
+					return m, tea.Quit
+				}
 			case "esc":
 				if m.list.SettingFilter() {
 					m.list.ResetFilter()
@@ -246,16 +323,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Auto-activate filter on typing
 			if !m.list.SettingFilter() && msg.Type == tea.KeyRunes {
-				// We want to support navigation keys (j/k) if not typing?
-				// User said: "Writing anything should just start filtering".
-				// This implies fzf-style behavior where typing (even j/k) filters.
-				// Navigation must be done via arrows.
-
 				// Send a synthetic '/' key to start filtering
 				var cmd tea.Cmd
 				m.list, cmd = m.list.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 				cmds = append(cmds, cmd)
-				// The original key will be processed by the list update below
 			}
 		} else if m.state == viewInput {
 			// Input view specific keys
@@ -308,13 +379,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						val = *m.selectedRecipe.Parameters[i].Default
 					}
 
-					// Handle variadic args if necessary.
-					// For now, if user typed spaces in a singular arg, we preserve it as one arg?
-					// Just usually takes shell-split args.
-					// But usually TUI inputs map 1-to-1 with params.
-					// If the param kind is 'plus' or 'star' (variadic), we might want to Split it.
-					// 'diff file1 file2' are singular, so we append as is.
-
 					if m.selectedRecipe.Parameters[i].Kind == "plus" || m.selectedRecipe.Parameters[i].Kind == "star" {
 						// Split variadic
 						args = append(args, strings.Fields(val)...)
@@ -323,8 +387,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 
-				cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
-				m.finalCmd = cmdSlice
+				// Handle AI command special case (name is "AI Command")
+				// If it's an AI command, we just want to run the input string directly as a shell command?
+				// User wants "convert prompt to bash command" and then "Run".
+				// So if name is "AI Command", we should run `bash -c <cmd>` or just `<cmd>`?
+				// The previous code appends "just <task> <args>".
+				// Here we want to execute the raw command.
+
+				if m.selectedRecipe.Name == "AI Command" {
+					// We assume the first input is the full command
+					// We split it to handle arguments roughly, or use sh -c
+					// Using sh -c is safer for complex commands
+					m.finalCmd = []string{"sh", "-c", args[0]}
+				} else {
+					cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
+					m.finalCmd = cmdSlice
+				}
 				return m, tea.Quit
 			case "ctrl+f":
 				// Trigger fzf
@@ -336,7 +414,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				return m, tea.ExecProcess(c, func(err error) tea.Msg {
 					if err != nil {
-						// fzf cancelled or error
 						return nil
 					}
 					return pasteMsg(strings.TrimSpace(out.String()))
@@ -367,6 +444,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inputs[m.focusIndex] = input
 		}
 
+	case aiCompletionMsg:
+		m.state = viewInput
+		// Create a dummy recipe for the AI command
+		m.selectedRecipe = &Recipe{
+			Name:       "AI Command",
+			Parameters: []Parameter{{Name: "command", Default: nil}},
+		}
+		// Setup input
+		t := textinput.New()
+		t.Prompt = "Run: "
+		t.Width = m.terminalWidth - 10
+		t.SetValue(string(msg))
+		t.Focus()
+		m.inputs = []textinput.Model{t}
+		m.focusIndex = 0
+		return m, textinput.Blink
+
+	case spinner.TickMsg:
+		if m.state == viewGenerating {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+
 	case tea.WindowSizeMsg:
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
@@ -375,11 +476,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		listWidth := int(float64(msg.Width) * 0.35)
 
 		// Calculation of available width for viewport:
-		// Total Width = msg.Width
-		// List takes: listWidth + 2 (MarginRight)
-		// Viewport Style takes: 2 (Border) + 2 (Padding) = 4
-		// Remaining for content: msg.Width - listWidth - 2 - 4 = msg.Width - listWidth - 6
-		// We add a little extra safety buffer (-2) to prevent edge-case wrapping
 		viewportWidth := msg.Width - listWidth - 8
 
 		headerHeight := lipgloss.Height(m.list.Title)
@@ -399,11 +495,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.list.SelectedItem() != nil {
-			cmds = append(cmds, m.updateViewportContent(m.list.SelectedItem().(recipeItem).name))
-		}
-
-		if m.list.SelectedItem() != nil {
-			cmds = append(cmds, m.updateViewportContent(m.list.SelectedItem().(recipeItem).name))
+			if i, ok := m.list.SelectedItem().(recipeItem); ok {
+				cmds = append(cmds, m.updateViewportContent(i.name))
+			}
 		}
 
 	case recipeContentMsg:
@@ -425,17 +519,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list, cmd = m.list.Update(msg)
 		cmds = append(cmds, cmd)
 
-		currItem := m.list.SelectedItem()
-		if currItem != nil && (prevItem == nil || prevItem.(recipeItem).name != currItem.(recipeItem).name) {
-			cmds = append(cmds, m.updateViewportContent(currItem.(recipeItem).name))
-		}
+		// Sync AI prompt
+		*m.aiPrompt = m.list.FilterValue()
 
-		if _, ok := msg.(tea.WindowSizeMsg); ok && currItem != nil {
-			cmds = append(cmds, m.updateViewportContent(currItem.(recipeItem).name))
+		currItem := m.list.SelectedItem()
+		// Only update viewport if it's a recipeItem
+		if currItem != nil {
+			if i, ok := currItem.(recipeItem); ok {
+				if prevItem == nil || prevItem.FilterValue() != i.name {
+					cmds = append(cmds, m.updateViewportContent(i.name))
+				}
+				if _, ok := msg.(tea.WindowSizeMsg); ok {
+					cmds = append(cmds, m.updateViewportContent(i.name))
+				}
+			} else if _, ok := currItem.(aiItem); ok {
+				// Clear viewport or show help for AI?
+				m.viewport.SetContent(lipgloss.NewStyle().Width(m.viewport.Width).Render("Select to generate a command using AI based on your search text."))
+			}
 		}
 
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
+	} else if m.state == viewGenerating {
+		// Just wait for spinner/AI
 	} else {
 		// Update all inputs
 		for i := range m.inputs {
@@ -469,6 +575,9 @@ func (m model) View() string {
 	var content string
 	if m.state == viewInput {
 		content = m.inputView()
+	} else if m.state == viewGenerating {
+		content = fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
+		content = lipgloss.Place(m.terminalWidth, m.terminalHeight-1, lipgloss.Center, lipgloss.Center, content)
 	} else {
 		listStyle := lipgloss.NewStyle().MarginRight(2)
 		viewportStyle := lipgloss.NewStyle().
