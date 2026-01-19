@@ -28,6 +28,9 @@ var (
 	statusMessageStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.AdaptiveColor{Light: "#04B575", Dark: "#04B575"}).
 				Render
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241"))
 )
 
 type state int
@@ -199,6 +202,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == viewList {
 			// Handle special keys for the list view
 			switch msg.String() {
+			case "q":
+				if !m.list.SettingFilter() {
+					return m, tea.Quit
+				}
 			case "enter":
 				// Select task (works for both browsing and filtering)
 				if i, ok := m.list.SelectedItem().(recipeItem); ok {
@@ -361,26 +368,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.WindowSizeMsg:
-
 		m.terminalWidth = msg.Width
 		m.terminalHeight = msg.Height
 
 		// Layout logic
 		listWidth := int(float64(msg.Width) * 0.35)
-		viewportWidth := msg.Width - listWidth - 4 // minus padding/borders
+
+		// Calculation of available width for viewport:
+		// Total Width = msg.Width
+		// List takes: listWidth + 2 (MarginRight)
+		// Viewport Style takes: 2 (Border) + 2 (Padding) = 4
+		// Remaining for content: msg.Width - listWidth - 2 - 4 = msg.Width - listWidth - 6
+		// We add a little extra safety buffer (-2) to prevent edge-case wrapping
+		viewportWidth := msg.Width - listWidth - 8
 
 		headerHeight := lipgloss.Height(m.list.Title)
-		footerHeight := 2
+		listFooterHeight := 2 // Pagination
+		globalFooterHeight := 1
 
-		m.list.SetSize(listWidth, msg.Height-headerHeight-footerHeight)
+		// Adjust list height to fit global footer
+		m.list.SetSize(listWidth, msg.Height-headerHeight-listFooterHeight-globalFooterHeight)
 
 		if !m.ready {
-			m.viewport = viewport.New(viewportWidth, msg.Height-2)
+			m.viewport = viewport.New(viewportWidth, msg.Height-2-globalFooterHeight)
 			m.viewport.HighPerformanceRendering = false
 			m.ready = true
 		} else {
 			m.viewport.Width = viewportWidth
-			m.viewport.Height = msg.Height - 2
+			m.viewport.Height = msg.Height - 2 - globalFooterHeight
+		}
+
+		if m.list.SelectedItem() != nil {
+			cmds = append(cmds, m.updateViewportContent(m.list.SelectedItem().(recipeItem).name))
 		}
 
 		if m.list.SelectedItem() != nil {
@@ -388,7 +407,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case recipeContentMsg:
-		m.viewport.SetContent(string(msg))
+		content := string(msg)
+		// Wrap content to fit viewport width to prevent UI breakage
+		if m.viewport.Width > 0 {
+			content = lipgloss.NewStyle().Width(m.viewport.Width).Render(content)
+		}
+		m.viewport.SetContent(content)
 
 	case error:
 		m.err = msg
@@ -442,21 +466,35 @@ func (m model) View() string {
 		return "\n  Initializing..."
 	}
 
+	var content string
 	if m.state == viewInput {
-		return m.inputView()
+		content = m.inputView()
+	} else {
+		listStyle := lipgloss.NewStyle().MarginRight(2)
+		viewportStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(0, 1)
+
+		content = lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			listStyle.Render(m.list.View()),
+			viewportStyle.Width(m.viewport.Width).Height(m.viewport.Height).Render(m.viewport.View()),
+		)
 	}
 
-	listStyle := lipgloss.NewStyle().MarginRight(2)
-	viewportStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("62")).
-		Padding(0, 1)
+	return lipgloss.JoinVertical(lipgloss.Left, content, m.footerView())
+}
 
-	return lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		listStyle.Render(m.list.View()),
-		viewportStyle.Width(m.viewport.Width).Height(m.viewport.Height).Render(m.viewport.View()),
-	)
+func (m model) footerView() string {
+	var keys []string
+	if m.state == viewList {
+		keys = []string{"↑/↓/j/k: navigate", "enter: select", "type: search", "q: quit"}
+	} else if m.state == viewInput {
+		keys = []string{"tab/shift+tab: nav fields", "ctrl+f: find file", "enter: run", "esc: cancel"}
+	}
+	// Join with some spacing and styling. Ensure it spans full width or looks good.
+	return helpStyle.Render(strings.Join(keys, " • "))
 }
 
 func (m model) inputView() string {
@@ -478,12 +516,12 @@ func (m model) inputView() string {
 		}
 	}
 
-	b.WriteString("\n\n(Enter to next/run, Ctrl+f to find file, Esc to cancel)")
+	// Instructions moved to footer
 
 	// Center logic could be here, but simple render is fine
 	return lipgloss.Place(
 		m.terminalWidth,
-		m.terminalHeight,
+		m.terminalHeight-1, // Subtract footer height
 		lipgloss.Center,
 		lipgloss.Center,
 		b.String(),
