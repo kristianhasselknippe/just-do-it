@@ -44,6 +44,7 @@ const (
 	viewApiKeyInput
 	viewProviderSelect
 	viewModelInput
+	viewModelSelect
 )
 
 // Data structures for parsing 'just --dump --dump-format json'
@@ -95,6 +96,7 @@ type model struct {
 	list           list.Model
 	viewport       viewport.Model
 	inputs         []textinput.Model
+	modelList      list.Model // New list for models
 	spinner        spinner.Model
 	focusIndex     int
 	providerIndex  int // Track selected provider
@@ -108,6 +110,13 @@ type model struct {
 	finalCmd       []string
 	aiPrompt       *string // Shared pointer for AI item title
 }
+
+// modelItem implements list.Item for model selection
+type modelItem string
+
+func (m modelItem) Title() string       { return string(m) }
+func (m modelItem) Description() string { return "" }
+func (m modelItem) FilterValue() string { return string(m) }
 
 func main() {
 	s := spinner.New()
@@ -234,6 +243,9 @@ type pasteMsg string
 // Msg for AI completion
 type aiCompletionMsg string
 
+// Msg when models are fetched
+type modelsFetchedMsg []string
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		cmds []tea.Cmd
@@ -253,6 +265,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.state == viewList {
 			switch msg.String() {
+			case "ctrl+p":
+				m.state = viewProviderSelect
+				m.providerIndex = 0
+				return m, nil
 			case "enter":
 				// Check if AI item selected
 				if item, ok := m.list.SelectedItem().(aiItem); ok {
@@ -367,15 +383,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "enter":
 				if m.state == viewProviderSelect {
-					m.state = viewApiKeyInput
-					t := textinput.New()
-					t.Placeholder = "Key..."
-					t.EchoMode = textinput.EchoPassword
-					t.Width = 50
-					t.Focus()
-					m.inputs = []textinput.Model{t}
-					m.focusIndex = 0
-					return m, nil
+					// Check for existing key first?
+					// Flow: Select Provider -> Check Config/Env -> If missing ask Key -> Fetch Models -> Select Model
+
+					cfg, _ := LoadConfig()
+					if cfg == nil {
+						cfg = &Config{}
+					}
+
+					var key string
+					if m.providerIndex == 0 {
+						key = cfg.GoogleAPIKey
+						if key == "" {
+							key = os.Getenv("GOOGLE_API_KEY")
+						}
+					} else {
+						key = cfg.OpenAIAPIKey
+						if key == "" {
+							key = os.Getenv("OPENAI_API_KEY")
+						}
+					}
+
+					if key == "" {
+						m.state = viewApiKeyInput
+						t := textinput.New()
+						t.Placeholder = "Key..."
+						t.EchoMode = textinput.EchoPassword
+						t.Width = 50
+						t.Focus()
+						m.inputs = []textinput.Model{t}
+						m.focusIndex = 0
+						return m, nil
+					}
+
+					// Have key, fetch models
+					m.state = viewGenerating // Reuse loading state
+					provider := "google"
+					if m.providerIndex == 1 {
+						provider = "openai"
+					}
+
+					return m, tea.Batch(
+						m.spinner.Tick,
+						func() tea.Msg {
+							models, err := ListModels(provider, key)
+							if err != nil {
+								// Fallback to manual input if list fails
+								return fmt.Errorf("list_models_failed")
+							}
+							return modelsFetchedMsg(models)
+						},
+					)
 				}
 
 				if m.state == viewApiKeyInput {
@@ -395,23 +453,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							return m, nil
 						}
 
-						// Transition to Model Input
-						m.state = viewModelInput
-						t := textinput.New()
-						t.Placeholder = "Model ID..."
-						t.Width = 50
-						t.Focus()
-						m.inputs = []textinput.Model{t}
-						m.focusIndex = 0
-						return m, nil
+						// Now fetch models
+						m.state = viewGenerating
+						provider := "google"
+						if m.providerIndex == 1 {
+							provider = "openai"
+						}
+
+						return m, tea.Batch(
+							m.spinner.Tick,
+							func() tea.Msg {
+								models, err := ListModels(provider, key)
+								if err != nil {
+									return fmt.Errorf("list_models_failed")
+								}
+								return modelsFetchedMsg(models)
+							},
+						)
 					}
 					return m, nil
 				}
 
 				if m.state == viewModelInput {
+					// Manual entry fallback
 					model := m.inputs[0].Value()
-					// If empty, we don't set it (use default in code)
-
 					cfg, _ := LoadConfig()
 					if cfg == nil {
 						cfg = &Config{}
@@ -423,18 +488,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						} else {
 							cfg.OpenAIModel = model
 						}
-						if err := SaveConfig(cfg); err != nil {
-							m.err = fmt.Errorf("failed to save config: %v", err)
-							return m, nil
-						}
+						SaveConfig(cfg)
 					}
-
 					m.state = viewList
 					m.inputs = nil
 					return m, nil
 				}
 
 				if m.focusIndex < len(m.inputs)-1 {
+
 					m.inputs[m.focusIndex].Blur()
 					m.focusIndex++
 					m.inputs[m.focusIndex].Focus()
@@ -550,11 +612,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.viewport.SetContent(content)
 
+	case modelsFetchedMsg:
+		m.state = viewModelSelect
+		items := []list.Item{}
+		for _, name := range msg {
+			items = append(items, modelItem(name))
+		}
+
+		// Setup model list
+		delegate := list.NewDefaultDelegate()
+		m.modelList = list.New(items, delegate, 0, 0)
+		m.modelList.Title = "Select Model"
+		m.modelList.SetShowHelp(false)
+
+		// Set size
+		headerHeight := lipgloss.Height(m.modelList.Title)
+		m.modelList.SetSize(m.terminalWidth, m.terminalHeight-headerHeight-2)
+		return m, nil
+
 	case error:
 		if msg.Error() == "MISSING_API_KEY" {
 			m.state = viewProviderSelect
 			m.err = nil
 			m.providerIndex = 0
+			return m, nil
+		}
+		if msg.Error() == "list_models_failed" {
+			// Fallback to manual input
+			m.state = viewModelInput
+			t := textinput.New()
+			t.Placeholder = "Model ID (e.g. gemini-2.0-flash)"
+			t.Width = 50
+			t.Focus()
+			m.inputs = []textinput.Model{t}
+			m.focusIndex = 0
+			m.err = nil // Clear error
 			return m, nil
 		}
 		m.err = msg
@@ -588,6 +680,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, vpCmd)
 	} else if m.state == viewGenerating {
 		// wait
+	} else if m.state == viewModelSelect {
+		var cmd tea.Cmd
+		prevItem := m.modelList.SelectedItem()
+		m.modelList, cmd = m.modelList.Update(msg)
+		cmds = append(cmds, cmd)
+
+		// Handle selection
+		if m.modelList.SelectedItem() != nil && m.modelList.SelectedItem() != prevItem {
+			// just nav
+		}
+
+		// Check for enter key specifically since list consumes it
+		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "enter" {
+			if i, ok := m.modelList.SelectedItem().(modelItem); ok {
+				cfg, _ := LoadConfig()
+				if cfg == nil {
+					cfg = &Config{}
+				}
+
+				if m.providerIndex == 0 {
+					cfg.GoogleModel = string(i)
+				} else {
+					cfg.OpenAIModel = string(i)
+				}
+				SaveConfig(cfg)
+				m.state = viewList
+				return m, nil
+			}
+		}
+		// Check for esc
+		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "esc" {
+			m.state = viewList
+			return m, nil
+		}
+
 	} else {
 		for i := range m.inputs {
 			var cmd tea.Cmd
@@ -621,6 +748,9 @@ func (m model) View() string {
 	var content string
 	if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect || m.state == viewModelInput {
 		content = m.inputView()
+	} else if m.state == viewModelSelect {
+		listStyle := lipgloss.NewStyle().Margin(1, 2)
+		content = listStyle.Render(m.modelList.View())
 	} else if m.state == viewGenerating {
 		content = fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
 		content = lipgloss.Place(m.terminalWidth, m.terminalHeight-1, lipgloss.Center, lipgloss.Center, content)
@@ -644,7 +774,7 @@ func (m model) View() string {
 func (m model) footerView() string {
 	var keys []string
 	if m.state == viewList {
-		keys = []string{"↑/↓/j/k: navigate", "enter: select", "type: search", "q: quit"}
+		keys = []string{"↑/↓/j/k: navigate", "enter: select", "type: search", "ctrl+p: ai settings", "q: quit"}
 	} else if m.state == viewInput {
 		keys = []string{"tab/shift+tab: nav fields", "ctrl+f: find file", "enter: run", "esc: cancel"}
 	} else if m.state == viewApiKeyInput {
@@ -653,6 +783,8 @@ func (m model) footerView() string {
 		keys = []string{"↑/↓: select provider", "enter: next", "esc: cancel"}
 	} else if m.state == viewModelInput {
 		keys = []string{"enter: save", "esc: cancel"}
+	} else if m.state == viewModelSelect {
+		keys = []string{"↑/↓: navigate", "enter: select", "type: filter", "esc: cancel"}
 	}
 	// Join with some spacing and styling. Ensure it spans full width or looks good.
 	return helpStyle.Render(strings.Join(keys, " • "))

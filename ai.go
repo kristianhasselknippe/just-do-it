@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"sort"
+	"strings"
 
+	"github.com/google/generative-ai-go/genai"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/googleai"
 	"github.com/tmc/langchaingo/llms/openai"
+	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 )
 
 // GenerateCommand uses an LLM to convert a natural language prompt into a bash command.
@@ -76,4 +83,74 @@ Command:`),
 	}
 
 	return completion.Choices[0].Content, nil
+}
+
+// ListModels returns a list of available model names for the given provider and key.
+func ListModels(provider, key string) ([]string, error) {
+	if provider == "google" {
+		ctx := context.Background()
+		client, err := genai.NewClient(ctx, option.WithAPIKey(key))
+		if err != nil {
+			return nil, err
+		}
+		defer client.Close()
+
+		var models []string
+		iter := client.ListModels(ctx)
+		for {
+			m, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			// Only include generation models
+			if strings.Contains(m.Name, "gemini") {
+				// Name comes as "models/gemini-pro", strip prefix if needed or keep it
+				// langchaingo usually expects just "gemini-pro" but "models/" might be needed for pure API
+				// Let's strip "models/" for display
+				name := strings.TrimPrefix(m.Name, "models/")
+				models = append(models, name)
+			}
+		}
+		return models, nil
+	} else if provider == "openai" {
+		// Simple HTTP request for OpenAI
+		req, err := http.NewRequest("GET", "https://api.openai.com/v1/models", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("OpenAI API returned status: %s", resp.Status)
+		}
+
+		var result struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, err
+		}
+
+		var models []string
+		for _, m := range result.Data {
+			if strings.HasPrefix(m.ID, "gpt") {
+				models = append(models, m.ID)
+			}
+		}
+		sort.Strings(models)
+		return models, nil
+	}
+	return nil, fmt.Errorf("unknown provider")
 }
