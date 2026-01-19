@@ -43,6 +43,7 @@ const (
 	viewGenerating
 	viewApiKeyInput
 	viewProviderSelect
+	viewModelInput
 )
 
 // Data structures for parsing 'just --dump --dump-format json'
@@ -154,10 +155,6 @@ func main() {
 
 	// Custom filter to always include AI item
 	m.list.Filter = func(term string, targets []string) []list.Rank {
-		// If term is empty, bubbles/list handles it (usually)
-		// But if called, return nil to match standard behavior?
-		// Actually standard Filter returns matches.
-
 		// If targets is empty, return nil
 		if len(targets) == 0 {
 			return nil
@@ -228,15 +225,7 @@ func getJustDump() (*JustDump, error) {
 type recipeContentMsg string
 
 func (m model) Init() tea.Cmd {
-	// Load the first item if it exists
-	if len(m.recipes) > 0 {
-		if len(m.list.Items()) > 0 {
-			if i, ok := m.list.Items()[0].(recipeItem); ok {
-				return m.updateViewportContent(i.name)
-			}
-		}
-	}
-	return nil
+	return tea.EnterAltScreen
 }
 
 // Msg to paste text into input
@@ -247,7 +236,6 @@ type aiCompletionMsg string
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
-		cmd  tea.Cmd
 		cmds []tea.Cmd
 	)
 
@@ -330,7 +318,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 
-		} else if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect {
+		} else if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect || m.state == viewModelInput {
 			switch msg.String() {
 			case "esc":
 				m.state = viewList
@@ -338,7 +326,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "tab", "shift+tab", "up", "down":
-				if m.state == viewApiKeyInput {
+				if m.state == viewApiKeyInput || m.state == viewModelInput {
 					return m, nil
 				}
 				if m.state == viewProviderSelect {
@@ -406,10 +394,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.err = fmt.Errorf("failed to save config: %v", err)
 							return m, nil
 						}
-						m.state = viewList
-						m.inputs = nil
+
+						// Transition to Model Input
+						m.state = viewModelInput
+						t := textinput.New()
+						t.Placeholder = "Model ID..."
+						t.Width = 50
+						t.Focus()
+						m.inputs = []textinput.Model{t}
+						m.focusIndex = 0
 						return m, nil
 					}
+					return m, nil
+				}
+
+				if m.state == viewModelInput {
+					model := m.inputs[0].Value()
+					// If empty, we don't set it (use default in code)
+
+					cfg, _ := LoadConfig()
+					if cfg == nil {
+						cfg = &Config{}
+					}
+
+					if model != "" {
+						if m.providerIndex == 0 {
+							cfg.GoogleModel = model
+						} else {
+							cfg.OpenAIModel = model
+						}
+						if err := SaveConfig(cfg); err != nil {
+							m.err = fmt.Errorf("failed to save config: %v", err)
+							return m, nil
+						}
+					}
+
+					m.state = viewList
+					m.inputs = nil
 					return m, nil
 				}
 
@@ -457,7 +478,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case pasteMsg:
-		if (m.state == viewInput || m.state == viewApiKeyInput) && len(msg) > 0 {
+		if (m.state == viewInput || m.state == viewApiKeyInput || m.state == viewModelInput) && len(msg) > 0 {
 			input := m.inputs[m.focusIndex]
 			val := input.Value()
 			cursor := input.Position()
@@ -542,6 +563,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if m.state == viewList {
 		prevItem := m.list.SelectedItem()
+		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
 		cmds = append(cmds, cmd)
 
@@ -561,12 +583,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		m.viewport, cmd = m.viewport.Update(msg)
-		cmds = append(cmds, cmd)
+		var vpCmd tea.Cmd
+		m.viewport, vpCmd = m.viewport.Update(msg)
+		cmds = append(cmds, vpCmd)
 	} else if m.state == viewGenerating {
 		// wait
 	} else {
 		for i := range m.inputs {
+			var cmd tea.Cmd
 			m.inputs[i], cmd = m.inputs[i].Update(msg)
 			cmds = append(cmds, cmd)
 		}
@@ -595,7 +619,7 @@ func (m model) View() string {
 	}
 
 	var content string
-	if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect {
+	if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect || m.state == viewModelInput {
 		content = m.inputView()
 	} else if m.state == viewGenerating {
 		content = fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
@@ -624,9 +648,11 @@ func (m model) footerView() string {
 	} else if m.state == viewInput {
 		keys = []string{"tab/shift+tab: nav fields", "ctrl+f: find file", "enter: run", "esc: cancel"}
 	} else if m.state == viewApiKeyInput {
-		keys = []string{"enter: save key", "esc: cancel"}
+		keys = []string{"enter: next", "esc: cancel"}
 	} else if m.state == viewProviderSelect {
 		keys = []string{"↑/↓: select provider", "enter: next", "esc: cancel"}
+	} else if m.state == viewModelInput {
+		keys = []string{"enter: save", "esc: cancel"}
 	}
 	// Join with some spacing and styling. Ensure it spans full width or looks good.
 	return helpStyle.Render(strings.Join(keys, " • "))
@@ -666,6 +692,27 @@ func (m model) inputView() string {
 		b.WriteString(titleStyle.Render("Enter API Key"))
 		b.WriteString("\n\n")
 		b.WriteString("Please enter your Google (Gemini) or OpenAI API Key.\nIt will be saved to your config file.\n\n")
+		b.WriteString(m.inputs[0].View())
+
+		return lipgloss.Place(
+			m.terminalWidth,
+			m.terminalHeight-1,
+			lipgloss.Center,
+			lipgloss.Center,
+			b.String(),
+		)
+	}
+
+	if m.state == viewModelInput {
+		b.WriteString(titleStyle.Render("Enter Model Name"))
+		b.WriteString("\n\n")
+
+		defaultModel := "gemini-2.0-flash"
+		if m.providerIndex == 1 {
+			defaultModel = "gpt-4o"
+		}
+
+		b.WriteString(fmt.Sprintf("Enter the model ID to use (default: %s).\nLeave empty to use default.\n\n", defaultModel))
 		b.WriteString(m.inputs[0].View())
 
 		return lipgloss.Place(

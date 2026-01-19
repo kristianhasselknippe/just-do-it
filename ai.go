@@ -32,13 +32,21 @@ func GenerateCommand(prompt string) (string, error) {
 
 	// Check for Google API Key first
 	if googleKey != "" {
+		model := "gemini-2.0-flash"
+		if cfg != nil && cfg.GoogleModel != "" {
+			model = cfg.GoogleModel
+		}
 		// Use a model confirmed to be available via API listing
-		llm, err = googleai.New(ctx, googleai.WithAPIKey(googleKey), googleai.WithDefaultModel("gemini-2.0-flash"))
+		llm, err = googleai.New(ctx, googleai.WithAPIKey(googleKey), googleai.WithDefaultModel(model))
 		if err != nil {
 			return "", fmt.Errorf("failed to create GoogleAI client: %w", err)
 		}
 	} else if openaiKey != "" {
-		llm, err = openai.New(openai.WithToken(openaiKey))
+		model := "gpt-4o"
+		if cfg != nil && cfg.OpenAIModel != "" {
+			model = cfg.OpenAIModel
+		}
+		llm, err = openai.New(openai.WithToken(openaiKey), openai.WithModel(model))
 		if err != nil {
 			return "", fmt.Errorf("failed to create OpenAI client: %w", err)
 		}

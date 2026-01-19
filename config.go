@@ -11,6 +11,8 @@ import (
 type Config struct {
 	GoogleAPIKey string `json:"google_api_key,omitempty"`
 	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
+	GoogleModel  string `json:"google_model,omitempty"`
+	OpenAIModel  string `json:"openai_model,omitempty"`
 }
 
 func GetConfigPath() (string, error) {
