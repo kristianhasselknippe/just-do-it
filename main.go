@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -263,7 +264,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.state == viewList {
-			// Handle special keys for the list view
 			switch msg.String() {
 			case "enter":
 				// Check if AI item selected
@@ -285,12 +285,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					)
 				}
 
-				// Select task (works for both browsing and filtering)
+				// Select task
 				if i, ok := m.list.SelectedItem().(recipeItem); ok {
 					recipe := m.recipes[i.name]
 					m.selectedRecipe = &recipe
 
-					// Check params
 					if len(recipe.Parameters) > 0 {
 						m.state = viewInput
 						m.inputs = make([]textinput.Model, len(recipe.Parameters))
@@ -309,7 +308,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.focusIndex = 0
 						return m, textinput.Blink
 					} else {
-						// Execute immediately
 						m.finalCmd = []string{"just", i.name}
 						return m, tea.Quit
 					}
@@ -326,18 +324,251 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 
-			// Auto-activate filter on typing
 			if !m.list.SettingFilter() && msg.Type == tea.KeyRunes {
-				// Send a synthetic '/' key to start filtering
 				var cmd tea.Cmd
 				m.list, cmd = m.list.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 				cmds = append(cmds, cmd)
 			}
-			// Update all inputs
-			for i := range m.inputs {
-				m.inputs[i], cmd = m.inputs[i].Update(msg)
-				cmds = append(cmds, cmd)
+
+		} else if m.state == viewInput || m.state == viewApiKeyInput || m.state == viewProviderSelect {
+			switch msg.String() {
+			case "esc":
+				m.state = viewList
+				m.inputs = nil
+				return m, nil
+
+			case "tab", "shift+tab", "up", "down":
+				if m.state == viewApiKeyInput {
+					return m, nil
+				}
+				if m.state == viewProviderSelect {
+					if msg.String() == "up" {
+						if m.providerIndex > 0 {
+							m.providerIndex--
+						}
+					} else if msg.String() == "down" {
+						if m.providerIndex < 1 {
+							m.providerIndex++
+						}
+					}
+					return m, nil
+				}
+
+				s := msg.String()
+				if s == "up" || s == "shift+tab" {
+					m.focusIndex--
+				} else {
+					m.focusIndex++
+				}
+
+				if m.focusIndex > len(m.inputs)-1 {
+					m.focusIndex = 0
+				} else if m.focusIndex < 0 {
+					m.focusIndex = len(m.inputs) - 1
+				}
+
+				cmds := make([]tea.Cmd, len(m.inputs))
+				for i := 0; i <= len(m.inputs)-1; i++ {
+					if i == m.focusIndex {
+						cmds[i] = m.inputs[i].Focus()
+						continue
+					}
+					m.inputs[i].Blur()
+				}
+				return m, tea.Batch(cmds...)
+
+			case "enter":
+				if m.state == viewProviderSelect {
+					m.state = viewApiKeyInput
+					t := textinput.New()
+					t.Placeholder = "Key..."
+					t.EchoMode = textinput.EchoPassword
+					t.Width = 50
+					t.Focus()
+					m.inputs = []textinput.Model{t}
+					m.focusIndex = 0
+					return m, nil
+				}
+
+				if m.state == viewApiKeyInput {
+					key := m.inputs[0].Value()
+					if key != "" {
+						cfg, _ := LoadConfig()
+						if cfg == nil {
+							cfg = &Config{}
+						}
+						if m.providerIndex == 0 {
+							cfg.GoogleAPIKey = key
+						} else {
+							cfg.OpenAIAPIKey = key
+						}
+						if err := SaveConfig(cfg); err != nil {
+							m.err = fmt.Errorf("failed to save config: %v", err)
+							return m, nil
+						}
+						m.state = viewList
+						m.inputs = nil
+						return m, nil
+					}
+					return m, nil
+				}
+
+				if m.focusIndex < len(m.inputs)-1 {
+					m.inputs[m.focusIndex].Blur()
+					m.focusIndex++
+					m.inputs[m.focusIndex].Focus()
+					return m, textinput.Blink
+				}
+
+				args := []string{}
+				for i, input := range m.inputs {
+					val := input.Value()
+					if val == "" && m.selectedRecipe.Parameters[i].Default != nil {
+						val = *m.selectedRecipe.Parameters[i].Default
+					}
+					if m.selectedRecipe.Parameters[i].Kind == "plus" || m.selectedRecipe.Parameters[i].Kind == "star" {
+						args = append(args, strings.Fields(val)...)
+					} else {
+						args = append(args, val)
+					}
+				}
+
+				if m.selectedRecipe.Name == "AI Command" {
+					m.finalCmd = []string{"sh", "-c", args[0]}
+				} else {
+					cmdSlice := append([]string{"just", m.selectedRecipe.Name}, args...)
+					m.finalCmd = cmdSlice
+				}
+				return m, tea.Quit
+
+			case "ctrl+f":
+				c := exec.Command("fzf")
+				var out bytes.Buffer
+				c.Stdout = &out
+				c.Stdin = os.Stdin
+				c.Stderr = os.Stderr
+				return m, tea.ExecProcess(c, func(err error) tea.Msg {
+					if err != nil {
+						return nil
+					}
+					return pasteMsg(strings.TrimSpace(out.String()))
+				})
 			}
+		}
+
+	case pasteMsg:
+		if (m.state == viewInput || m.state == viewApiKeyInput) && len(msg) > 0 {
+			input := m.inputs[m.focusIndex]
+			val := input.Value()
+			cursor := input.Position()
+			newVal := ""
+			if cursor >= len(val) {
+				newVal = val + string(msg)
+			} else {
+				newVal = val[:cursor] + string(msg) + val[cursor:]
+			}
+			input.SetValue(newVal)
+			input.SetCursor(cursor + len(msg))
+			m.inputs[m.focusIndex] = input
+		}
+
+	case aiCompletionMsg:
+		m.state = viewInput
+		m.selectedRecipe = &Recipe{
+			Name:       "AI Command",
+			Parameters: []Parameter{{Name: "command", Default: nil}},
+		}
+		t := textinput.New()
+		t.Prompt = "Run: "
+		t.Width = m.terminalWidth - 10
+		t.SetValue(string(msg))
+		t.Focus()
+		m.inputs = []textinput.Model{t}
+		m.focusIndex = 0
+		return m, textinput.Blink
+
+	case spinner.TickMsg:
+		if m.state == viewGenerating {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+
+	case tea.WindowSizeMsg:
+		m.terminalWidth = msg.Width
+		m.terminalHeight = msg.Height
+
+		listWidth := int(float64(msg.Width) * 0.35)
+		viewportWidth := msg.Width - listWidth - 8
+
+		headerHeight := lipgloss.Height(m.list.Title)
+		listFooterHeight := 2
+		globalFooterHeight := 1
+
+		m.list.SetSize(listWidth, msg.Height-headerHeight-listFooterHeight-globalFooterHeight)
+
+		if !m.ready {
+			m.viewport = viewport.New(viewportWidth, msg.Height-2-globalFooterHeight)
+			m.viewport.HighPerformanceRendering = false
+			m.ready = true
+		} else {
+			m.viewport.Width = viewportWidth
+			m.viewport.Height = msg.Height - 2 - globalFooterHeight
+		}
+
+		if m.list.SelectedItem() != nil {
+			if i, ok := m.list.SelectedItem().(recipeItem); ok {
+				cmds = append(cmds, m.updateViewportContent(i.name))
+			}
+		}
+
+	case recipeContentMsg:
+		content := string(msg)
+		if m.viewport.Width > 0 {
+			content = lipgloss.NewStyle().Width(m.viewport.Width).Render(content)
+		}
+		m.viewport.SetContent(content)
+
+	case error:
+		if msg.Error() == "MISSING_API_KEY" {
+			m.state = viewProviderSelect
+			m.err = nil
+			m.providerIndex = 0
+			return m, nil
+		}
+		m.err = msg
+		return m, nil
+	}
+
+	if m.state == viewList {
+		prevItem := m.list.SelectedItem()
+		m.list, cmd = m.list.Update(msg)
+		cmds = append(cmds, cmd)
+
+		*m.aiPrompt = m.list.FilterValue()
+
+		currItem := m.list.SelectedItem()
+		if currItem != nil {
+			if i, ok := currItem.(recipeItem); ok {
+				if prevItem == nil || prevItem.FilterValue() != i.name {
+					cmds = append(cmds, m.updateViewportContent(i.name))
+				}
+				if _, ok := msg.(tea.WindowSizeMsg); ok {
+					cmds = append(cmds, m.updateViewportContent(i.name))
+				}
+			} else if _, ok := currItem.(aiItem); ok {
+				m.viewport.SetContent(lipgloss.NewStyle().Width(m.viewport.Width).Render("Select to generate a command using AI based on your search text."))
+			}
+		}
+
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	} else if m.state == viewGenerating {
+		// wait
+	} else {
+		for i := range m.inputs {
+			m.inputs[i], cmd = m.inputs[i].Update(msg)
+			cmds = append(cmds, cmd)
 		}
 	}
 
