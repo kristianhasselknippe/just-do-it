@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -127,7 +128,18 @@ func (m modelItem) Title() string       { return string(m) }
 func (m modelItem) Description() string { return "" }
 func (m modelItem) FilterValue() string { return string(m) }
 
+// logDebug writes to a debug file
+func logDebug(format string, args ...interface{}) {
+	f, err := os.OpenFile("debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s: %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+}
+
 func main() {
+	logDebug("Application started")
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
@@ -284,7 +296,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = viewGenerating
 					prompt := *item.prompt
 					m.streamContent = ""
-					ch := make(chan streamResult)
+					ch := make(chan streamResult, 100)
 					m.streamChan = ch
 
 					go func() {
@@ -572,6 +584,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case streamResult:
+		logDebug("Update received streamResult: chunk=%q done=%v err=%v", msg.chunk, msg.done, msg.err)
 		if msg.err != nil {
 			if msg.err.Error() == "MISSING_API_KEY" {
 				m.state = viewProviderSelect
@@ -806,10 +819,19 @@ func (m model) View() string {
 		listStyle := lipgloss.NewStyle().Margin(1, 2)
 		content = listStyle.Render(m.modelList.View())
 	} else if m.state == viewGenerating {
-		content = fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
+		header := fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
+
+		var output string
 		if m.streamContent != "" {
-			content += fmt.Sprintf("\n\n%s", lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(m.streamContent))
+			output = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("205")).
+				Padding(1, 2).
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("62")).
+				Render(m.streamContent)
 		}
+
+		content = lipgloss.JoinVertical(lipgloss.Center, header, output)
 		content = lipgloss.Place(m.terminalWidth, m.terminalHeight-1, lipgloss.Center, lipgloss.Center, content)
 	} else {
 		listStyle := lipgloss.NewStyle().MarginRight(2)
@@ -830,7 +852,11 @@ func (m model) View() string {
 
 func waitForStream(ch <-chan streamResult) tea.Cmd {
 	return func() tea.Msg {
-		return <-ch
+		res, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return res
 	}
 }
 

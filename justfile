@@ -8,11 +8,17 @@ ls:
 hello name="World":
     echo "Hello, {{name}}!"
 
-# Builds the project (mock)
+# Builds the project
 build:
-    @echo "Building..."
-    sleep 1
-    @echo "Done!"
+    @echo "Building just-do-it..."
+    go build -o just-do-it
+    @echo "Build complete!"
+
+# Installs the binary to $GOPATH/bin
+install:
+    @echo "Installing just-do-it..."
+    go install
+    @echo "Install complete!"
 
 # Deploys the project
 deploy: build
