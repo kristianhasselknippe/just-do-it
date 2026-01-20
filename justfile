@@ -1,4 +1,4 @@
-# Justfile for testing just-ui
+# Justfile for testing just-do-it
 
 # Lists files in the current directory
 ls:

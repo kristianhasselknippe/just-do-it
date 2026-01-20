@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -109,6 +110,14 @@ type model struct {
 	terminalHeight int
 	finalCmd       []string
 	aiPrompt       *string // Shared pointer for AI item title
+	streamContent  string
+	streamChan     chan streamResult
+}
+
+type streamResult struct {
+	chunk string
+	err   error
+	done  bool
 }
 
 // modelItem implements list.Item for model selection
@@ -274,18 +283,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item, ok := m.list.SelectedItem().(aiItem); ok {
 					m.state = viewGenerating
 					prompt := *item.prompt
+					m.streamContent = ""
+					ch := make(chan streamResult)
+					m.streamChan = ch
+
+					go func() {
+						defer close(ch)
+						ctx := context.Background()
+						_, err := GenerateCommand(ctx, prompt, func(s string) {
+							ch <- streamResult{chunk: s}
+						})
+						if err != nil {
+							ch <- streamResult{err: err}
+						}
+						ch <- streamResult{done: true}
+					}()
+
 					return m, tea.Batch(
 						m.spinner.Tick,
-						func() tea.Msg {
-							cmdStr, err := GenerateCommand(prompt)
-							if err != nil {
-								if err.Error() == "MISSING_API_KEY" {
-									return err
-								}
-								return fmt.Errorf("AI Error: %v", err)
-							}
-							return aiCompletionMsg(cmdStr)
-						},
+						waitForStream(ch),
 					)
 				}
 
@@ -555,6 +571,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inputs[m.focusIndex] = input
 		}
 
+	case streamResult:
+		if msg.err != nil {
+			if msg.err.Error() == "MISSING_API_KEY" {
+				m.state = viewProviderSelect
+				m.err = nil
+				m.providerIndex = 0
+				return m, nil
+			}
+			m.err = fmt.Errorf("AI Error: %v", msg.err)
+			m.state = viewList
+			return m, nil
+		}
+		if msg.done {
+			return m, func() tea.Msg { return aiCompletionMsg(m.streamContent) }
+		}
+		m.streamContent += msg.chunk
+		return m, waitForStream(m.streamChan)
+
 	case aiCompletionMsg:
 		m.state = viewInput
 		m.selectedRecipe = &Recipe{
@@ -773,6 +807,9 @@ func (m model) View() string {
 		content = listStyle.Render(m.modelList.View())
 	} else if m.state == viewGenerating {
 		content = fmt.Sprintf("\n\n   %s Generating command...", m.spinner.View())
+		if m.streamContent != "" {
+			content += fmt.Sprintf("\n\n%s", lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(m.streamContent))
+		}
 		content = lipgloss.Place(m.terminalWidth, m.terminalHeight-1, lipgloss.Center, lipgloss.Center, content)
 	} else {
 		listStyle := lipgloss.NewStyle().MarginRight(2)
@@ -789,6 +826,12 @@ func (m model) View() string {
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, content, m.footerView())
+}
+
+func waitForStream(ch <-chan streamResult) tea.Cmd {
+	return func() tea.Msg {
+		return <-ch
+	}
 }
 
 func (m model) footerView() string {

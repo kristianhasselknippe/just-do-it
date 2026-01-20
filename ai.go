@@ -18,10 +18,9 @@ import (
 )
 
 // GenerateCommand uses an LLM to convert a natural language prompt into a bash command.
-func GenerateCommand(prompt string) (string, error) {
+func GenerateCommand(ctx context.Context, prompt string, onToken func(string)) (string, error) {
 	cfg, _ := LoadConfig() // Ignore error, treat as empty config
 
-	ctx := context.Background()
 	var llm llms.Model
 	var err error
 
@@ -73,6 +72,12 @@ Command:`),
 	completion, err := llm.GenerateContent(ctx, content,
 		llms.WithTemperature(0.0),
 		llms.WithMaxTokens(256),
+		llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+			if onToken != nil {
+				onToken(string(chunk))
+			}
+			return nil
+		}),
 	)
 	if err != nil {
 		return "", fmt.Errorf("AI generation failed: %w", err)

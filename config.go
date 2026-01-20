@@ -16,7 +16,7 @@ type Config struct {
 }
 
 func GetConfigPath() (string, error) {
-	return xdg.ConfigFile("just-ui/config.json")
+	return xdg.ConfigFile("just-do-it/config.json")
 }
 
 func LoadConfig() (*Config, error) {

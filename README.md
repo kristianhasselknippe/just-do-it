@@ -1,4 +1,4 @@
-# just-ui
+# just-do-it
 
 A TUI (Text User Interface) for [just](https://github.com/casey/just) task runner.
 
@@ -12,17 +12,17 @@ A TUI (Text User Interface) for [just](https://github.com/casey/just) task runne
 ## Installation
 
 ```bash
-go install github.com/yourusername/just-ui@latest
+go install github.com/yourusername/just-do-it@latest
 # OR build from source
-go build -o just-ui
+go build -o just-do-it
 ```
 
 ## Usage
 
-Simply run `just-ui` in a directory containing a `justfile`.
+Simply run `just-do-it` in a directory containing a `justfile`.
 
 ```bash
-./just-ui
+./just-do-it
 ```
 
 ### Controls
