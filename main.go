@@ -192,7 +192,10 @@ func main() {
 
 		// Real targets are all except the last one (AI item)
 		realTargets := targets[:len(targets)-1]
-		matches := fuzzy.Find(term, realTargets)
+		// Normalize term for better fuzzy matching (e.g., "start all" matches "start-all")
+		replacer := strings.NewReplacer(" ", "", "-", "", "_", "")
+		normalizedTerm := replacer.Replace(term)
+		matches := fuzzy.Find(normalizedTerm, realTargets)
 
 		ranks := make([]list.Rank, len(matches))
 		for i, match := range matches {
@@ -677,7 +680,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(targets) == 0 {
 				return nil
 			}
-			matches := fuzzy.Find(term, targets)
+			// Normalize term for better fuzzy matching
+			replacer := strings.NewReplacer(" ", "", "-", "", "_", "")
+			normalizedTerm := replacer.Replace(term)
+			matches := fuzzy.Find(normalizedTerm, targets)
 			ranks := make([]list.Rank, len(matches))
 			for i, match := range matches {
 				ranks[i] = list.Rank{
@@ -723,6 +729,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list, cmd = m.list.Update(msg)
 		cmds = append(cmds, cmd)
 
+		// If filtering and we have matches, ensure the first one (best match) is selected
+		if m.list.SettingFilter() && len(m.list.VisibleItems()) > 0 {
+			// Only auto-select if the message wasn't a navigation key
+			isNavKey := false
+			if k, ok := msg.(tea.KeyMsg); ok {
+				switch k.String() {
+				case "up", "down", "j", "k", "pgup", "pgdown", "home", "end":
+					isNavKey = true
+				}
+			}
+			if !isNavKey {
+				m.list.Select(0)
+			}
+		}
+
 		*m.aiPrompt = m.list.FilterValue()
 
 		currItem := m.list.SelectedItem()
@@ -757,6 +778,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.modelList, cmd = m.modelList.Update(msg)
 		cmds = append(cmds, cmd)
+
+		// If filtering and we have matches, ensure the first one (best match) is selected
+		if m.modelList.SettingFilter() && len(m.modelList.VisibleItems()) > 0 {
+			isNavKey := false
+			if k, ok := msg.(tea.KeyMsg); ok {
+				switch k.String() {
+				case "up", "down", "j", "k", "pgup", "pgdown", "home", "end":
+					isNavKey = true
+				}
+			}
+			if !isNavKey {
+				m.modelList.Select(0)
+			}
+		}
 
 		// Check for enter key specifically since list consumes it
 		if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "enter" {
